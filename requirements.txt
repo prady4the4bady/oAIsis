@@ -1,0 +1,12 @@
+streamlit==1.39.0
+streamlit-webrtc==0.47.7
+edge-tts==6.1.12
+google-genai==1.5.0
+qdrant-client==1.11.3
+Pillow==10.4.0
+opencv-python-headless==4.10.0.84
+av==13.1.0
+numpy==1.26.4
+requests==2.32.3
+python-dotenv==1.0.1
+google-cloud-texttospeech==2.21.0

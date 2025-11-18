@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Streamlit cache
+.streamlit/cache/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.log
