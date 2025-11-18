@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import importlib
 import importlib.util
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -31,23 +32,22 @@ class OpenVisionResult:
 
 
 class OpenVisionService:
-    def __init__(self, device: str | None = None) -> None:
+    def __init__(self, device: str | None = None, lazy: bool = True) -> None:
+        self.device = device or "cpu"
+        self.lazy = lazy
         self.caption_pipeline: Any | None = None
+        self._caption_error: Optional[str] = None
+        self._caption_lock = threading.Lock()
         self.ocr_readers: Dict[str, Any] = {}
-        if pipeline is not None:
-            try:
-                self.caption_pipeline = pipeline(
-                    "image-to-text",
-                    model="Salesforce/blip-image-captioning-large",
-                    device=device or "cpu",
-                )
-            except Exception as exc:  # pragma: no cover - heavy model failures
-                LOGGER.warning("Unable to load BLIP captioning pipeline: %s", exc)
-                self.caption_pipeline = None
+        if not self.lazy:
+            self._ensure_caption_pipeline()
 
     @property
     def available(self) -> bool:
-        return self.caption_pipeline is not None or easyocr is not None
+        caption_ready = (self.caption_pipeline is not None) or (
+            pipeline is not None and self._caption_error is None
+        )
+        return caption_ready or easyocr is not None
 
     def analyze(self, image: Any, mode: str, language: str) -> Optional[OpenVisionResult]:
         if mode == "ocr":
@@ -86,10 +86,17 @@ class OpenVisionService:
         return self.ocr_readers.get(key)
 
     def _run_caption(self, image: Any, mode: str, language: str) -> Optional[OpenVisionResult]:
-        if self.caption_pipeline is None:
+        if not self._ensure_caption_pipeline():
             raise RuntimeError("transformers captioning pipeline is unavailable")
+        caption_pipeline = self.caption_pipeline
+        if caption_pipeline is None:  # mypy/pyright guard
+            raise RuntimeError("transformers captioning pipeline failed to initialize")
         prompt = self._language_prompt(mode=mode, language=language)
-        outputs = self.caption_pipeline(image, generate_kwargs={"max_new_tokens":120}, prompt=prompt)
+        outputs = caption_pipeline(
+            image,
+            generate_kwargs={"max_new_tokens": 120},
+            prompt=prompt,
+        )
         caption = outputs[0].get("generated_text", "").strip()
         if not caption:
             caption = "Unable to describe the scene."
@@ -159,3 +166,23 @@ class OpenVisionService:
         if any(obj.get("direction") == "right" for obj in objects):
             return {"suggestion": "turn_left", "reason": "Objects on the right"}
         return {"suggestion": "move_forward", "reason": "Path appears clear"}
+
+    def _ensure_caption_pipeline(self) -> bool:
+        if self.caption_pipeline is not None:
+            return True
+        if pipeline is None or self._caption_error is not None:
+            return False
+        with self._caption_lock:
+            if self.caption_pipeline is not None:
+                return True
+            try:
+                self.caption_pipeline = pipeline(
+                    "image-to-text",
+                    model="Salesforce/blip-image-captioning-large",
+                    device=self.device,
+                )
+            except Exception as exc:  # pragma: no cover - heavy model failures
+                LOGGER.warning("Unable to load BLIP captioning pipeline: %s", exc)
+                self._caption_error = str(exc)
+                self.caption_pipeline = None
+        return self.caption_pipeline is not None

@@ -48,6 +48,7 @@ requirements.txt           # Python dependencies
 | `OPUS_API_URL` | Opus logging endpoint (optional) |
 | `OPUS_WORKFLOW_ID` | Workflow ID to tag every Opus log entry |
 | `OPUS_API_KEY` | Bearer token for Opus logging (optional) |
+| `OPUS_WORKFLOW_URL` | HTTPS endpoint to invoke the Opus workflow run API |
 | `ANALYSIS_INTERVAL_SECONDS` | Seconds between automatic frame captures (default 2) |
 | `ENABLE_MEMORY` | `true`/`false` toggle for Qdrant usage on startup |
 | `GUIDELY_STUN_URLS` | Comma-separated STUN server URLs to override the defaults (leave blank for Google STUN pool) |
@@ -112,8 +113,9 @@ Because Edge TTS is online but keyless, deployments without Google credentials s
 
 ### Opus workflow logging
 - Set `OPUS_API_URL`, `OPUS_API_KEY`, and `OPUS_WORKFLOW_ID` from the workflow you shared (e.g., *Guidely AI Navigation Assistant Workflow*).
-- The app logs these actions so you can map them to the workflow nodes: `scene_analysis_started`, `scene_analysis_completed`, `location_saved`, `location_recognized`, `emergency_triggered`, `mode_changed`.
-- Each payload includes the current mode/language or location metadata so Opus dashboards can branch exactly like the workflow diagram.
+- Provide `OPUS_WORKFLOW_URL` to call the workflow run endpoint (e.g., `https://workflow.opus.com/api/run`). Every analysis now sends the detected objects, inferred hazards, scene description, and a JPEG snapshot to Opus so the workflow branches you shared (“Extract Environmental Features → Determine User Status → … → Workflow Output”) can execute automatically.
+- Returning fields such as `navigation_instruction`, `guidance_text`, `priority_level`, and `error_message` are rendered inside the Streamlit guidance panel and persisted in session state. If the workflow is unreachable the UI shows the last error but continues to function locally.
+- The legacy log-only events remain (`scene_analysis_started`, `scene_analysis_completed`, `location_saved`, `location_recognized`, `emergency_triggered`, `mode_changed`) so you can keep historical traces in Opus even when the workflow call is disabled.
 
 ### WebRTC connectivity
 1. On Windows the app now forces the `WindowsSelectorEventLoopPolicy`, which removes the `AttributeError: 'NoneType' object has no attribute 'sendto'` crash created by aiortc.
@@ -146,10 +148,10 @@ Add `--skip-insert` if your tenant disallows writes during verification.
 
 ## End-to-end workflow
 1. **Capture** – `streamlit-webrtc` streams the live camera into the `VideoProcessor`, which throttles frames to one every two seconds and converts them to PIL images.
-2. **Analyze** – `GeminiService` sends the compressed frame plus a mode-specific prompt to **Gemini 2.0 Flash Experimental**. Gemini responds with guidance tailored to Navigation/OCR/Describe plus the chosen language instructions.
-3. **Embed + Memory** – `EmbeddingClient` calls Gemini Text Embedding 004 on the guidance text. If scene memory is enabled, `QdrantMemory` searches for similar embeddings (0.85+ cosine). Recognized locations get surfaced to the UI and logged.
-4. **Voice** – The latest guidance text feeds `TTSService` (Google Cloud Text-to-Speech). SSML emphasis highlights warnings, and the audio autoplays while the text remains in a large-font panel.
-5. **Logging** – `OpusLogger` records every critical action (`scene_analysis_started/completed`, `location_saved`, `location_recognized`, `mode_changed`, `emergency_triggered`) so your Opus workflow stays in sync.
+2. **Analyze** – `RealtimeAnalyzer` first tries the on-device `OpenVisionService` (BLIP captioning + EasyOCR). If the offline stack cannot answer, it falls back to `GeminiService` (Gemini 2.0 Flash Experimental) with mode- and language-aware prompts so both Opus and the UI receive consistent guidance.
+3. **Embed + Memory** – The same analyzer feeds `EmbeddingClient` (local MiniLM → Gemini fallback) to vectorize the guidance, and `QdrantMemory` searches for >=0.85 cosine matches whenever memory is enabled. Matches get pushed into Streamlit state and logged back to Opus with the similarity score.
+4. **Voice** – Guidance text flows to `TTSService`, which attempts Edge TTS first (for ultra-low latency) and automatically falls back to Google Cloud Text-to-Speech when needed. SSML emphasis highlights hazards before autoplaying audio beside the text panel.
+5. **Logging** – Every analyzer run emits a structured payload to Opus (`provider`, detected objects, movement advice, recognized location) in addition to the existing lifecycle events (`scene_analysis_started/completed`, `location_saved`, `mode_changed`, `emergency_triggered`).
 6. **Emergency** – The emergency button plays a local siren (generated via NumPy) and logs the event to Opus for escalation.
 
 ## Testing checklist

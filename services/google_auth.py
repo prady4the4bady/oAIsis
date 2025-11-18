@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
@@ -24,18 +24,18 @@ def load_service_account_credentials(scopes: Optional[List[str]] = None) -> Opti
     for env_name, blob in json_env_candidates:
         if blob:
             try:
-                info = json.loads(blob)
+                info: Dict[str, Any] = json.loads(blob)
             except json.JSONDecodeError:
                 LOGGER.error("Invalid JSON in %s; please paste a valid service-account blob.", env_name)
                 return None
-            return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+            return service_account.Credentials.from_service_account_info(info, scopes=scopes)  # type: ignore
 
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if credentials_path:
         if not os.path.exists(credentials_path):
             LOGGER.error("Google credentials file '%s' not found.", credentials_path)
             return None
-        return service_account.Credentials.from_service_account_file(credentials_path, scopes=scopes)
+        return service_account.Credentials.from_service_account_file(credentials_path, scopes=scopes)  # type: ignore
 
     return None
 

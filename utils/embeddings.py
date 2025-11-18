@@ -190,16 +190,23 @@ class EmbeddingClient:
 
     def _extract_vector(self, data: Dict[str, Any]) -> List[float]:
         if self._use_vertex:
-            predictions = data.get("predictions") or []
+            predictions: List[Any] = data.get("predictions") or []
             if not predictions:
                 raise ValueError("No predictions returned")
             embeddings = predictions[0].get("embeddings")
-            values = None
+            values: Optional[List[float]] = None
             if isinstance(embeddings, list) and embeddings:
-                values = embeddings[0].get("values")
+                first_embedding: Any = embeddings[0]
+                if isinstance(first_embedding, dict):
+                    first_embedding_dict = cast(Dict[str, Any], first_embedding)
+                    raw_values = first_embedding_dict.get("values")
+                    if isinstance(raw_values, list):
+                        values = cast(List[float], raw_values)
             if values is None:
-                values = predictions[0].get("values")
-            if not isinstance(values, list):
+                raw_values = predictions[0].get("values")
+                if isinstance(raw_values, list):
+                    values = cast(List[float], raw_values)
+            if values is None:
                 raise ValueError("Vertex embedding values missing")
         else:
             embedding = data.get("embedding")

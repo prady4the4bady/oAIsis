@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 
 if os.name == "nt":
@@ -11,7 +13,7 @@ import queue
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast, no_type_check
 
 import av
 import numpy as np
@@ -23,11 +25,13 @@ from streamlit_webrtc import (
     RTCConfiguration,
     VideoProcessorBase,
     WebRtcMode,
-    webrtc_streamer,
+    WebRtcStreamerContext,
+    webrtc_streamer as _webrtc_streamer,  # type: ignore[misc]
 )
+from streamlit.delta_generator import DeltaGenerator
 from services.gemini_service import GeminiService
 from services.open_vision import OpenVisionResult, OpenVisionService
-from services.opus_service import OpusLogger
+from services.opus_service import OpusLogger, WorkflowResult
 from services.qdrant_service import QdrantMemory
 from services.tts_service import TTSService
 from utils.camera_utils import bgr_frame_to_pil, generate_emergency_tone
@@ -42,8 +46,11 @@ FRAME_INTERVAL_SECONDS = float(os.getenv("ANALYSIS_INTERVAL_SECONDS", "2"))
 DEFAULT_MEMORY_ENABLED = (os.getenv("ENABLE_MEMORY", "true").lower() == "true")
 
 LOGGER = logging.getLogger(__name__)
-
 FrameArray = NDArray[np.uint8]
+EmbeddingArray = NDArray[Any]
+
+WebRtcStreamerFunc = Callable[..., WebRtcStreamerContext[VideoProcessorBase, Any]]
+webrtc_streamer = cast(WebRtcStreamerFunc, _webrtc_streamer)
 EmbeddingArray = NDArray[Any]
 
 
@@ -115,6 +122,109 @@ LANGUAGE_LABELS = {
     "हिन्दी": "hi",
 }
 
+HAZARD_KEYWORDS = {
+    "exposed wiring": "exposed wiring",
+    "broken glass": "broken glass",
+    "chemical": "chemical spill",
+    "spill": "chemical spill",
+    "smoke": "smoke",
+    "fire": "fire",
+    "debris": "debris",
+    "hole": "ground hole",
+    "stairs": "stairs",
+    "stair": "stairs",
+    "vehicle": "vehicle",
+    "car": "vehicle",
+    "bike": "bicycle",
+    "bicycle": "bicycle",
+    "crowd": "crowd",
+    "traffic": "traffic",
+}
+
+HAZARD_OBJECT_LABELS = {
+    "car": "vehicle",
+    "vehicle": "vehicle",
+    "truck": "vehicle",
+    "bus": "vehicle",
+    "bicycle": "bicycle",
+    "bike": "bicycle",
+    "stairs": "stairs",
+    "stair": "stairs",
+}
+
+OBJECT_KEYWORDS = {
+    "person",
+    "people",
+    "pedestrian",
+    "car",
+    "vehicle",
+    "bicycle",
+    "traffic light",
+    "sign",
+    "bench",
+    "tree",
+    "dog",
+    "cat",
+    "door",
+    "stairs",
+    "window",
+    "bus",
+    "truck",
+}
+
+
+@no_type_check
+def render_guidance_panel(
+    guidance_placeholder: DeltaGenerator, recognized_placeholder: DeltaGenerator
+) -> None:
+    """Render the textual guidance, workflow output, and recognized locations."""
+
+    guidance_text = st.session_state.get("guidance_text") or "Awaiting camera input…"
+    movement = cast(Optional[MovementAdvice], st.session_state.get("movement_instruction"))
+    detected_objects = cast(List[DetectedObject], st.session_state.get("detected_objects") or [])
+    workflow_instruction = st.session_state.get("workflow_instruction")
+    workflow_guidance = st.session_state.get("workflow_guidance")
+    workflow_priority = st.session_state.get("workflow_priority")
+    workflow_error = st.session_state.get("workflow_error")
+    recognized_locations = cast(List[str], st.session_state.get("recognized_locations") or [])
+
+    guidance_panel = guidance_placeholder.container()
+    guidance_panel.subheader("Latest guidance")
+    guidance_panel.write(guidance_text)
+
+    if movement:
+        move_reason = f"Reason: {movement.reason}" if movement.reason else ""
+        guidance_panel.info(f"Suggested movement: {movement.suggestion}. {move_reason}".strip())
+
+    if workflow_instruction or workflow_guidance or workflow_priority or workflow_error:
+        guidance_panel.divider()
+        guidance_panel.caption("Workflow insights")
+        if workflow_instruction:
+            guidance_panel.write(f"Instruction: {workflow_instruction}")
+        if workflow_guidance:
+            guidance_panel.write(f"Guidance: {workflow_guidance}")
+        if workflow_priority:
+            guidance_panel.write(f"Priority: {workflow_priority}")
+        if workflow_error:
+            guidance_panel.warning(f"Workflow error: {workflow_error}")
+
+    if detected_objects:
+        guidance_panel.divider()
+        guidance_panel.caption("Detected objects")
+        for obj in detected_objects[:6]:
+            label = obj.label
+            distance = f"{obj.distance_m:.1f} m" if obj.distance_m is not None else "?"
+            direction = obj.direction or "unspecified"
+            guidance_panel.write(f"• {label} ({direction}, {distance})")
+
+    recognized_panel = recognized_placeholder.container()
+    recognized_panel.subheader("Recognized locations")
+    if recognized_locations:
+        for location in recognized_locations[-5:][::-1]:
+            recognized_panel.write(f"📍 {location}")
+    else:
+        recognized_panel.caption("No saved locations yet.")
+
 
 @dataclass
 class MovementAdvice:
@@ -134,8 +244,391 @@ class AnalysisResult:
     guidance: str
     recognized_location: Optional[str]
     embedding: Optional[EmbeddingArray]
-    objects: List[DetectedObject] = field(default_factory=list)
+    objects: List[DetectedObject] = field(default_factory=lambda: [])
     movement: Optional[MovementAdvice] = None
+    provider: str = "gemini"
+    mode: str = "navigation"
+    language: str = "en"
+    match_score: Optional[float] = None
+    workflow: Optional[WorkflowResult] = None
+
+
+class RealtimeAnalyzer:
+    """Coordinates open-source vision, Gemini fallback, memory lookup, and Opus logging."""
+
+    def __init__(
+        self,
+        gemini: GeminiService,
+        embeddings: EmbeddingClient,
+        opus: OpusLogger,
+        open_vision: OpenVisionService,
+        qdrant: Optional[QdrantMemory],
+    ) -> None:
+        self._gemini = gemini
+        self._embeddings = embeddings
+        self._opus = opus
+        self._open_vision = open_vision
+        self._qdrant = qdrant
+
+    def analyze(
+        self,
+        image: Image.Image,
+        mode: str,
+        language: str,
+        memory_enabled: bool,
+    ) -> AnalysisResult:
+        self._opus.log_action(
+            action="scene_analysis_started",
+            data={"mode": mode, "language": language},
+        )
+        try:
+            guidance, objects, movement, provider = self._run_vision_stack(
+                image=image,
+                mode=mode,
+                language=language,
+            )
+            embedding_vector = self._embeddings.embed_text(guidance)
+            recognized_location, match_score = self._maybe_match_location(
+                embedding_vector,
+                memory_enabled,
+            )
+            result = AnalysisResult(
+                guidance=guidance,
+                recognized_location=recognized_location,
+                embedding=embedding_vector,
+                objects=objects,
+                movement=movement,
+                provider=provider,
+                mode=mode,
+                language=language,
+                match_score=match_score,
+            )
+            workflow_result = self._maybe_run_workflow(
+                image=image,
+                guidance=guidance,
+                objects=objects,
+                movement=movement,
+                recognized_location=recognized_location,
+                match_score=match_score,
+            )
+            result.workflow = workflow_result
+            self._log_success(result)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            self._opus.log_action(
+                action="scene_analysis_completed",
+                status="error",
+                data={
+                    "mode": mode,
+                    "language": language,
+                    "error": str(exc),
+                },
+            )
+            raise
+
+    def _run_vision_stack(
+        self,
+        image: Image.Image,
+        mode: str,
+        language: str,
+    ) -> Tuple[str, List[DetectedObject], Optional[MovementAdvice], str]:
+        open_result = self._try_open_vision(image=image, mode=mode, language=language)
+        if open_result:
+            return self._from_open_result(open_result)
+        return self._run_gemini(image=image, mode=mode, language=language)
+
+    def _try_open_vision(
+        self,
+        image: Image.Image,
+        mode: str,
+        language: str,
+    ) -> Optional[OpenVisionResult]:
+        if not self._open_vision.available:
+            return None
+        try:
+            return self._open_vision.analyze(image=image, mode=mode, language=language)
+        except Exception as exc:  # pragma: no cover - best-effort fallback
+            LOGGER.warning("Open vision analysis failed: %s", exc)
+            self._opus.log_action(
+                action="open_vision_failed",
+                status="error",
+                data={"error": str(exc)},
+            )
+            return None
+
+    def _from_open_result(
+        self,
+        open_result: OpenVisionResult,
+    ) -> Tuple[str, List[DetectedObject], Optional[MovementAdvice], str]:
+        detected_objects: List[DetectedObject] = []
+        for entry in open_result.objects:
+            label = entry.get("label")
+            if not isinstance(label, str) or not label.strip():
+                continue
+            detected_objects.append(
+                DetectedObject(
+                    label=label.strip(),
+                    distance_m=cast(Optional[float], entry.get("distance_m")),
+                    direction=entry.get("direction"),
+                )
+            )
+        movement_dict = open_result.movement or {}
+        movement = None
+        suggestion = movement_dict.get("suggestion")
+        if isinstance(suggestion, str) and suggestion.strip():
+            reason = movement_dict.get("reason")
+            movement = MovementAdvice(
+                suggestion=suggestion.strip(),
+                reason=reason.strip() if isinstance(reason, str) and reason.strip() else None,
+            )
+        return open_result.guidance, detected_objects, movement, "open_vision"
+
+    def _run_gemini(
+        self,
+        image: Image.Image,
+        mode: str,
+        language: str,
+    ) -> Tuple[str, List[DetectedObject], Optional[MovementAdvice], str]:
+        prompt = MODE_PROMPTS[mode]
+        language_note = LANGUAGE_INSTRUCTIONS.get(language, "Respond clearly.")
+        response_mime = "application/json" if mode == "navigation" else None
+        raw_response = self._gemini.analyze_image(
+            image=image,
+            user_prompt=f"{prompt}\n\n{language_note}",
+            response_mime_type=response_mime,
+        )
+        guidance_text = raw_response
+        detected_objects: List[DetectedObject] = []
+        movement: Optional[MovementAdvice] = None
+        if mode == "navigation":
+            guidance_text, detected_objects, movement = parse_navigation_response(raw_response)
+        if not guidance_text:
+            raise ValueError("Gemini did not return guidance.")
+        return guidance_text, detected_objects, movement, "gemini"
+
+    def _maybe_match_location(
+        self,
+        embedding_vector: Optional[EmbeddingArray],
+        memory_enabled: bool,
+    ) -> Tuple[Optional[str], Optional[float]]:
+        if not memory_enabled or self._qdrant is None or embedding_vector is None:
+            return None, None
+        match = self._qdrant.search_scene(embedding_vector)
+        if not match:
+            return None, None
+        self._opus.log_action(
+            action="location_recognized",
+            data={"location": match.location_name, "score": match.score},
+        )
+        return match.location_name, match.score
+
+    def _log_success(self, result: AnalysisResult) -> None:
+        movement_dict: Optional[Dict[str, Optional[str]]] = (
+            {
+                "suggestion": result.movement.suggestion,
+                "reason": result.movement.reason,
+            }
+            if result.movement
+            else None
+        )
+        data: Dict[str, Any] = {
+            "mode": result.mode,
+            "language": result.language,
+            "provider": result.provider,
+            "recognized_location": result.recognized_location,
+            "match_score": result.match_score,
+            "objects": [
+                {
+                    "label": obj.label,
+                    "distance_m": obj.distance_m,
+                    "direction": obj.direction,
+                }
+                for obj in result.objects
+            ],
+            "movement": movement_dict,
+            "guidance_excerpt": (result.guidance[:480] + "…")
+            if len(result.guidance) > 480
+            else result.guidance,
+        }
+        self._opus.log_action(
+            action="scene_analysis_completed",
+            data=data,
+        )
+
+    def _maybe_run_workflow(
+        self,
+        *,
+        image: Image.Image,
+        guidance: str,
+        objects: List[DetectedObject],
+        movement: Optional[MovementAdvice],
+        recognized_location: Optional[str],
+        match_score: Optional[float],
+    ) -> Optional[WorkflowResult]:
+        try:
+            hazard_names, hazard_objects = self._extract_hazards(guidance, objects)
+            object_names = self._object_names(objects, guidance)
+            sensor_signals, derived = self._build_sensor_context(movement, objects)
+            object_positions = self._serialize_positions(objects)
+            hazard_positions = self._serialize_positions(hazard_objects)
+            extra_inputs: Dict[str, Any] = {
+                "speed": derived["speed"],
+                "is_moving": derived["is_moving"],
+                "hazard_names": hazard_names,
+                "object_names": object_names,
+                "ambient_light": sensor_signals["ambient_light"],
+                "obstacle_names": hazard_names,
+                "object_positions": object_positions,
+                "obstacle_positions": hazard_positions,
+                "hazard_positions": hazard_positions,
+                "orientation_angle": derived["orientation_angle"],
+                "user_orientation": derived["orientation_angle"],
+                "user_movement_status": "moving" if derived["is_moving"] else "stationary",
+                "place_name": recognized_location or "",
+                "is_familiar_place": bool(recognized_location),
+                "match_score": match_score,
+                "gyroscope_readings": sensor_signals["gyroscope"],
+                "accelerometer_readings": sensor_signals["accelerometer"],
+                "ambient_light_reading": sensor_signals["ambient_light"],
+            }
+            return self._opus.run_workflow(
+                scene_description=guidance,
+                hazards=hazard_names,
+                objects=object_names,
+                sensor_signals=sensor_signals,
+                image=image,
+                extra_inputs=extra_inputs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Opus workflow unavailable: %s", exc)
+            return None
+    def _extract_hazards(
+        self,
+        guidance: str,
+        objects: List[DetectedObject],
+    ) -> Tuple[List[str], List[DetectedObject]]:
+        hazards: set[str] = set()
+        hazard_objects: List[DetectedObject] = []
+        lowered = guidance.lower()
+        for keyword, label in HAZARD_KEYWORDS.items():
+            if keyword in lowered:
+                hazards.add(label)
+        for obj in objects:
+            mapped = HAZARD_OBJECT_LABELS.get(obj.label.lower())
+            if mapped:
+                hazards.add(mapped)
+                hazard_objects.append(obj)
+        return sorted(hazards), hazard_objects
+
+    def _object_names(self, objects: List[DetectedObject], guidance: str) -> List[str]:
+        if objects:
+            names: Set[str] = {obj.label for obj in objects if obj.label}
+        else:
+            names = set()
+            lowered = guidance.lower()
+            for keyword in OBJECT_KEYWORDS:
+                if keyword in lowered:
+                    names.add(keyword)
+        return sorted(names) or ["scene"]
+
+    def _build_sensor_context(
+        self,
+        movement: Optional[MovementAdvice],
+        objects: List[DetectedObject],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        suggestion = (movement.suggestion if movement else "").lower()
+        is_moving = suggestion not in {"stop", "hold", ""}
+        speed_map = {
+            "move_forward": 1.2,
+            "turn_left": 0.3,
+            "turn_right": 0.3,
+            "step_back": 0.2,
+            "stop": 0.0,
+        }
+        speed = speed_map.get(suggestion, 0.5 if is_moving else 0.0)
+        gyro = [0.0, 0.0, 0.0]
+        accel = [0.0, 0.0, 9.81]
+        if suggestion == "turn_left":
+            gyro[2] = -0.45
+        elif suggestion == "turn_right":
+            gyro[2] = 0.45
+        elif suggestion == "move_forward":
+            accel[1] = 0.12
+        orientation_angle = self._direction_to_angle(movement, objects)
+        try:
+            ambient_value = float(os.getenv("GUIDELY_AMBIENT_LIGHT", "350.0"))
+        except ValueError:
+            ambient_value = 350.0
+
+        sensor_signals: Dict[str, Any] = {
+            "gyroscope": gyro,
+            "accelerometer": accel,
+            "ambient_light": ambient_value,
+        }
+        derived: Dict[str, Any] = {
+            "speed": round(speed, 2),
+            "is_moving": is_moving,
+            "orientation_angle": orientation_angle,
+        }
+        return sensor_signals, derived
+
+    def _serialize_positions(self, objects: List[DetectedObject]) -> List[Dict[str, Any]]:
+        positions: List[Dict[str, Any]] = []
+        for obj in objects:
+            entry: Dict[str, Any] = {"label": obj.label}
+            if obj.distance_m is not None:
+                entry["distance_m"] = obj.distance_m
+            if obj.direction:
+                entry["direction"] = obj.direction
+                coords = self._direction_to_coords(obj.direction)
+                if coords:
+                    entry["x"], entry["y"] = coords
+                entry["orientation_angle"] = self._direction_label_to_angle(obj.direction)
+            positions.append(entry)
+        return positions
+
+    def _direction_to_angle(
+        self,
+        movement: Optional[MovementAdvice],
+        objects: List[DetectedObject],
+    ) -> float:
+        if movement and movement.suggestion in {"turn_left", "turn_right", "step_back"}:
+            cleaned = movement.suggestion.replace("turn_", "")
+            if cleaned == "step_back":
+                cleaned = "back"
+            return self._direction_label_to_angle(cleaned)
+        for obj in objects:
+            if obj.direction:
+                return self._direction_label_to_angle(obj.direction)
+        return 0.0
+
+    @staticmethod
+    def _direction_label_to_angle(direction: Optional[str]) -> float:
+        mapping = {
+            "ahead": 0.0,
+            "forward": 0.0,
+            "left": -90.0,
+            "right": 90.0,
+            "behind": 180.0,
+            "back": 180.0,
+        }
+        if not direction:
+            return 0.0
+        return mapping.get(direction.lower(), 0.0)
+
+    @staticmethod
+    def _direction_to_coords(direction: Optional[str]) -> Optional[Tuple[float, float]]:
+        mapping = {
+            "ahead": (0.0, 1.0),
+            "forward": (0.0, 1.0),
+            "left": (-1.0, 0.0),
+            "right": (1.0, 0.0),
+            "behind": (0.0, -1.0),
+            "back": (0.0, -1.0),
+        }
+        if not direction:
+            return None
+        return mapping.get(direction.lower())
 
 
 class VideoProcessor(VideoProcessorBase):
@@ -146,7 +639,7 @@ class VideoProcessor(VideoProcessorBase):
         self._last_enqueued = 0.0
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
+        img = frame.to_ndarray(format="bgr24").astype(np.uint8)
         now = time.time()
 
         if now - self._last_enqueued >= FRAME_INTERVAL_SECONDS:
@@ -165,7 +658,7 @@ class VideoProcessor(VideoProcessorBase):
 
 
 def init_session_state() -> None:
-    defaults = {
+    defaults: Dict[str, Any] = {
         "guidance_text": "Camera warming up…",
         "analysis_count": 0,
         "recognized_locations": [],
@@ -181,6 +674,10 @@ def init_session_state() -> None:
         "mode_logged": "navigation",
         "detected_objects": [],
         "movement_instruction": None,
+        "workflow_instruction": None,
+        "workflow_guidance": None,
+        "workflow_priority": None,
+        "workflow_error": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -192,6 +689,7 @@ def get_services() -> Dict[str, object]:
     gemini_api_key = os.getenv("GEMINI_API_KEY") or None
     opus_api_url = os.getenv("OPUS_API_URL", "")
     opus_api_key = os.getenv("OPUS_API_KEY", "")
+    opus_workflow_url = os.getenv("OPUS_WORKFLOW_URL", "")
     qdrant_url = os.getenv("QDRANT_URL", "")
     qdrant_key = os.getenv("QDRANT_API_KEY", "")
     qdrant_collection = os.getenv("QDRANT_COLLECTION", "guidely_scenes")
@@ -220,9 +718,16 @@ def get_services() -> Dict[str, object]:
             collection_name=qdrant_collection,
         )
 
-    opus = OpusLogger(api_url=opus_api_url, api_key=opus_api_key)
+    opus = OpusLogger(api_url=opus_api_url, api_key=opus_api_key, workflow_url=opus_workflow_url)
     tts = TTSService()
     open_vision = OpenVisionService()
+    analyzer = RealtimeAnalyzer(
+        gemini=gemini,
+        embeddings=embeddings,
+        opus=opus,
+        open_vision=open_vision,
+        qdrant=qdrant,
+    )
 
     return {
         "gemini": gemini,
@@ -231,6 +736,7 @@ def get_services() -> Dict[str, object]:
         "opus": opus,
         "tts": tts,
         "open_vision": open_vision,
+        "analyzer": analyzer,
     }
 
 
@@ -244,120 +750,10 @@ def log_mode_change(opus: OpusLogger, new_mode: str) -> None:
         st.session_state["mode_logged"] = new_mode
 
 
-def analyze_image(
-    image: Image.Image,
-    services: Dict[str, object],
-    mode: str,
-    language: str,
-) -> Optional[AnalysisResult]:
-    gemini: GeminiService = services["gemini"]
-    embeddings: EmbeddingClient = services["embeddings"]
-    qdrant: Optional[QdrantMemory] = services.get("qdrant")
-    opus: OpusLogger = services["opus"]
-    open_vision: OpenVisionService = services["open_vision"]
-
-    def build_result(
-        guidance_text: str,
-        detected_objects: List[DetectedObject],
-        movement: Optional[MovementAdvice],
-        provider: str,
-    ) -> AnalysisResult:
-        embedding_vector = embeddings.embed_text(guidance_text)
-        recognized = None
-
-        if (
-            st.session_state.get("memory_enabled", True)
-            and qdrant is not None
-            and embedding_vector is not None
-        ):
-            match = qdrant.search_scene(embedding_vector)
-            if match:
-                recognized = match.location_name
-                st.session_state.setdefault("recognized_locations", [])
-                if recognized not in st.session_state["recognized_locations"]:
-                    st.session_state["recognized_locations"].append(recognized)
-                opus.log_action(
-                    action="location_recognized",
-                    data={"location": recognized, "score": match.score},
-                )
-        opus.log_action(
-            action="scene_analysis_completed",
-            data={"mode": mode, "language": language, "provider": provider},
-        )
-
-        return AnalysisResult(
-            guidance=guidance_text,
-            recognized_location=recognized,
-            embedding=embedding_vector,
-            objects=detected_objects,
-            movement=movement,
-        )
-
-    prompt = MODE_PROMPTS[mode]
-    language_note = LANGUAGE_INSTRUCTIONS.get(language, "Respond clearly.")
-    opus.log_action(
-        action="scene_analysis_started",
-        data={"mode": mode, "language": language},
-    )
-
-    open_result: Optional[OpenVisionResult] = None
-    if open_vision.available:
-        try:
-            open_result = open_vision.analyze(image=image, mode=mode, language=language)
-        except Exception as exc:  # pragma: no cover - best effort fallback
-            LOGGER.warning("Open vision analysis failed: %s", exc)
-    if open_result:
-        guidance_text = open_result.guidance
-        detected_objects: List[DetectedObject] = []
-        for entry in open_result.objects:
-            label = entry.get("label")
-            if not isinstance(label, str) or not label.strip():
-                continue
-            detected_objects.append(
-                DetectedObject(
-                    label=label.strip(),
-                    distance_m=cast(Optional[float], entry.get("distance_m")),
-                    direction=entry.get("direction"),
-                )
-            )
-        movement_dict = open_result.movement or {}
-        movement = None
-        suggestion = movement_dict.get("suggestion") if isinstance(movement_dict, dict) else None
-        if isinstance(suggestion, str) and suggestion.strip():
-            reason = movement_dict.get("reason") if isinstance(movement_dict, dict) else None
-            movement = MovementAdvice(
-                suggestion=suggestion.strip(),
-                reason=reason.strip() if isinstance(reason, str) and reason.strip() else None,
-            )
-        return build_result(guidance_text, detected_objects, movement, provider="open_vision")
-
-    try:
-        response_mime = "application/json" if mode == "navigation" else None
-        raw_response = gemini.analyze_image(
-            image=image,
-            user_prompt=f"{prompt}\n\n{language_note}",
-            response_mime_type=response_mime,
-        )
-        guidance_text = raw_response
-        detected_objects: List[DetectedObject] = []
-        movement: Optional[MovementAdvice] = None
-        if mode == "navigation":
-            guidance_text, detected_objects, movement = parse_navigation_response(raw_response)
-        if not guidance_text:
-            raise ValueError("Gemini did not return guidance.")
-        return build_result(guidance_text, detected_objects, movement, provider="gemini")
-    except Exception as exc:
-        opus.log_action(
-            action="scene_analysis_completed",
-            status="error",
-            data={"error": str(exc)},
-        )
-        st.error(f"Unable to analyze the frame: {exc}")
-        return None
 
 
 def speak_guidance(text: str, language: str, services: Dict[str, object]) -> None:
-    tts: TTSService = services["tts"]
+    tts = cast(TTSService, services["tts"])
     try:
         audio_bytes = tts.synthesize(text=text, language=language)
         st.session_state["last_audio_bytes"] = audio_bytes
@@ -365,7 +761,7 @@ def speak_guidance(text: str, language: str, services: Dict[str, object]) -> Non
         st.warning(f"TTS unavailable: {exc}")
 
 
-def handle_emergency(audio_placeholder: st.delta_generator.DeltaGenerator, opus: OpusLogger) -> None:
+def handle_emergency(audio_placeholder: DeltaGenerator, opus: OpusLogger) -> None:
     opus.log_action("emergency_triggered", data={"timestamp": time.time()})
     tone = generate_emergency_tone()
     audio_placeholder.audio(tone, format="audio/wav", autoplay=True)
@@ -378,8 +774,8 @@ def save_current_location(
     description: str,
     embedding: Optional[EmbeddingArray],
 ) -> None:
-    qdrant: Optional[QdrantMemory] = services.get("qdrant")
-    opus: OpusLogger = services["opus"]
+    qdrant: Optional[QdrantMemory] = cast(Optional[QdrantMemory], services.get("qdrant"))
+    opus: OpusLogger = cast(OpusLogger, services["opus"])
 
     if not qdrant:
         st.warning("Qdrant is not configured. Set QDRANT_URL to enable memory.")
@@ -401,59 +797,6 @@ def save_current_location(
         st.success(f"Location '{location_name}' saved to memory!")
     else:
         st.error("Unable to save the location. Check Qdrant logs.")
-
-
-def render_guidance_panel(guidance_placeholder, recognized_placeholder):
-    guidance_placeholder.markdown(
-        f"""
-        <div class='guidance-box'>
-            <div class='guidance-title'>Current Guidance</div>
-            <div class='guidance-body'>{st.session_state['guidance_text']}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    panels: List[str] = []
-    if st.session_state.get("recognized_locations"):
-        panels.append(
-            "<div><strong>Recognized locations:</strong> "
-            + ", ".join(st.session_state["recognized_locations"])
-            + "</div>"
-        )
-
-    movement: Optional[MovementAdvice] = st.session_state.get("movement_instruction")
-    if movement:
-        reason_text = f" — {movement.reason}" if movement.reason else ""
-        panels.append(
-            f"<div class='movement-pill'><strong>Movement:</strong> {movement.suggestion}{reason_text}</div>"
-        )
-
-    detected_objects: List[DetectedObject] = st.session_state.get("detected_objects", [])
-    if detected_objects:
-        items = "".join(
-            f"<li>{obj.label}"
-            + (
-                f" • {obj.distance_m:.1f}m"
-                if isinstance(obj.distance_m, float)
-                else ""
-            )
-            + (f" • {obj.direction}" if obj.direction else "")
-            + "</li>"
-            for obj in detected_objects
-        )
-        panels.append(
-            "<div><strong>Detected objects:</strong><ul>"
-            + items
-            + "</ul></div>"
-        )
-
-    if panels:
-        recognized_placeholder.markdown(
-            "<div class='status-panel'>" + "".join(panels) + "</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        recognized_placeholder.empty()
 
 
 def inject_css() -> None:
@@ -491,6 +834,19 @@ def inject_css() -> None:
             margin-top: 1rem;
             font-size: 1rem;
             line-height: 1.35rem;
+        }
+        .priority-pill {
+            background: #4CAF50;
+            color: #0b0b0b;
+            padding: 0.2rem 0.6rem;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            margin-left: 0.35rem;
+        }
+        .warning-text {
+            color: #ffb74d;
+            margin-top: 0.35rem;
+            font-size: 0.95rem;
         }
         .status-panel ul {
             list-style: disc;
@@ -538,7 +894,8 @@ def main() -> None:
     init_session_state()
 
     services = get_services()
-    opus: OpusLogger = services["opus"]
+    opus = cast(OpusLogger, services["opus"])
+    analyzer = cast(RealtimeAnalyzer, services["analyzer"])
 
     st.sidebar.header("Guidely Controls")
 
@@ -607,15 +964,15 @@ def main() -> None:
     with st.sidebar.expander("WebRTC connectivity", expanded=False):
         stun_disabled = _env_flag("GUIDELY_DISABLE_STUN")
         force_turn = _env_flag("GUIDELY_FORCE_TURN")
-        st.write(
+        st.write(  # type: ignore[misc]
             "STUN disabled" if stun_disabled else "STUN enabled (Google pool or custom)"
         )
-        st.write(
+        st.write(  # type: ignore[misc]
             "TURN required (relay-only)" if force_turn else "TURN optional"
         )
         turn_urls_env = os.getenv("GUIDELY_TURN_URLS") or os.getenv("GUIDELY_TURN_URL") or ""
         turn_count = len([url for url in turn_urls_env.split(",") if url.strip()])
-        st.write(f"TURN URLs configured: {turn_count}")
+        st.write(f"TURN URLs configured: {turn_count}")  # type: ignore[misc]
         st.caption("Adjust GUIDELY_* env vars if you need different networking behavior.")
 
     video_col, guidance_col = st.columns([2, 1])
@@ -672,7 +1029,7 @@ def main() -> None:
         handle_emergency(audio_placeholder, opus)
 
     if webrtc_ctx and webrtc_ctx.state.playing and webrtc_ctx.video_processor:
-        processor: VideoProcessor = webrtc_ctx.video_processor
+        processor = cast(VideoProcessor, webrtc_ctx.video_processor)
         try:
             frame = processor.frame_queue.get_nowait()
         except queue.Empty:
@@ -681,12 +1038,16 @@ def main() -> None:
         if frame is not None:
             image = bgr_frame_to_pil(frame)
             preview_placeholder.image(image, caption="Current camera frame", use_column_width=True)
-            result = analyze_image(
-                image=image,
-                services=services,
-                mode=st.session_state["mode"],
-                language=st.session_state["language"],
-            )
+            try:
+                result = analyzer.analyze(
+                    image=image,
+                    mode=st.session_state["mode"],
+                    language=st.session_state["language"],
+                    memory_enabled=st.session_state.get("memory_enabled", True),
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Unable to analyze the frame: {exc}")
+                result = None
             if result:
                 st.session_state["guidance_text"] = result.guidance
                 st.session_state["analysis_count"] += 1
@@ -695,8 +1056,28 @@ def main() -> None:
                 st.session_state["last_analysis_time"] = time.time()
                 st.session_state["detected_objects"] = result.objects
                 st.session_state["movement_instruction"] = result.movement
+                workflow_output = result.workflow
+                if workflow_output:
+                    st.session_state["workflow_instruction"] = (
+                        workflow_output.navigation_instruction
+                        or workflow_output.navigation_decision
+                    )
+                    st.session_state["workflow_guidance"] = (
+                        workflow_output.guidance_text
+                        or workflow_output.navigation_decision
+                    )
+                    st.session_state["workflow_priority"] = workflow_output.priority_level
+                    st.session_state["workflow_error"] = workflow_output.error_message
+                else:
+                    st.session_state["workflow_instruction"] = None
+                    st.session_state["workflow_guidance"] = None
+                    st.session_state["workflow_priority"] = None
+                    st.session_state["workflow_error"] = None
 
                 if result.recognized_location:
+                    st.session_state.setdefault("recognized_locations", [])
+                    if result.recognized_location not in st.session_state["recognized_locations"]:
+                        st.session_state["recognized_locations"].append(result.recognized_location)
                     st.success(f"📍 Recognized: {result.recognized_location}")
 
                 render_guidance_panel(guidance_placeholder, recognized_placeholder)
@@ -736,7 +1117,7 @@ def parse_navigation_response(raw_text: str) -> Tuple[str, List[DetectedObject],
     guidance = str(payload.get("guidance") or raw_text).strip()
 
     objects: List[DetectedObject] = []
-    for entry in payload.get("objects", []) or []:
+    for entry in cast(List[Dict[str, Any]], payload.get("objects", []) or []):
         label = entry.get("label")
         if not isinstance(label, str):
             continue
@@ -751,7 +1132,7 @@ def parse_navigation_response(raw_text: str) -> Tuple[str, List[DetectedObject],
         )
 
     movement = None
-    movement_entry = payload.get("movement") or {}
+    movement_entry = cast(Dict[str, Any], payload.get("movement") or {})
     suggestion = movement_entry.get("suggestion")
     if isinstance(suggestion, str) and suggestion.strip():
         reason = movement_entry.get("reason")
@@ -767,6 +1148,6 @@ def _safe_float(value: object) -> Optional[float]:
     try:
         if value is None:
             return None
-        return float(value)
+        return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
