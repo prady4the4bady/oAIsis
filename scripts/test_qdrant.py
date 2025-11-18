@@ -6,7 +6,7 @@ import argparse
 import os
 import sys
 import uuid
-from typing import Tuple
+from typing import Any, List, Tuple, cast
 
 import numpy as np
 from dotenv import load_dotenv
@@ -154,10 +154,13 @@ def main() -> None:
     url, api_key, collection, vector_size = load_config(args)
 
     client = QdrantClient(url=url, api_key=api_key)
-    health = client.get_locks_status()  # lightweight health check
-    print("Connected to Qdrant cluster.")
-    if health and isinstance(health, dict):
-        print(f"Health status: {health}")
+    try:
+        collections_obj = cast(Any, client.get_collections())  # type: ignore[attr-defined]
+        maybe_list = getattr(collections_obj, "collections", None)
+        count = len(cast(List[Any], maybe_list)) if isinstance(maybe_list, list) else "unknown"
+        print(f"Connected to Qdrant cluster (collections: {count}).")
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Unable to reach Qdrant cluster: {exc}") from exc
 
     ensure_collection(client, collection, vector_size)
 

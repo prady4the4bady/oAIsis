@@ -33,7 +33,7 @@ class OpenVisionResult:
 class OpenVisionService:
     def __init__(self, device: str | None = None) -> None:
         self.caption_pipeline: Any | None = None
-        self.ocr_reader: Any | None = None
+        self.ocr_readers: Dict[str, Any] = {}
         if pipeline is not None:
             try:
                 self.caption_pipeline = pipeline(
@@ -44,33 +44,46 @@ class OpenVisionService:
             except Exception as exc:  # pragma: no cover - heavy model failures
                 LOGGER.warning("Unable to load BLIP captioning pipeline: %s", exc)
                 self.caption_pipeline = None
-        if easyocr is not None:
-            try:
-                self.ocr_reader = easyocr.Reader(["en", "ar", "hi"], gpu=False)
-            except Exception as exc:  # pragma: no cover
-                LOGGER.warning("Unable to initialize EasyOCR: %s", exc)
-                self.ocr_reader = None
 
     @property
     def available(self) -> bool:
-        return self.caption_pipeline is not None or self.ocr_reader is not None
+        return self.caption_pipeline is not None or easyocr is not None
 
     def analyze(self, image: Any, mode: str, language: str) -> Optional[OpenVisionResult]:
         if mode == "ocr":
-            return self._run_ocr(image)
+            return self._run_ocr(image, language)
         return self._run_caption(image=image, mode=mode, language=language)
 
-    def _run_ocr(self, image: Any) -> Optional[OpenVisionResult]:
-        if self.ocr_reader is None:
+    def _run_ocr(self, image: Any, language: str) -> Optional[OpenVisionResult]:
+        reader = self._ensure_ocr_reader(language)
+        if reader is None:
             raise RuntimeError("EasyOCR is not installed; cannot run offline OCR.")
         if np is None:
             raise RuntimeError("NumPy is required for EasyOCR preprocessing.")
         gray = np.array(image.convert("L"))
-        lines = self.ocr_reader.readtext(gray, detail=0)
+        lines = reader.readtext(gray, detail=0)
         text = "\n".join(line.strip() for line in lines if line.strip())
         if not text:
             text = "No text detected."
         return OpenVisionResult(guidance=text, objects=[], movement=None)
+
+    def _ensure_ocr_reader(self, language: str) -> Any | None:
+        if easyocr is None:
+            return None
+        lang_map = {
+            "en": ["en"],
+            "ar": ["ar", "en"],
+            "hi": ["hi", "en"],
+        }
+        lang_list = lang_map.get(language, ["en"])
+        key = ":".join(lang_list)
+        if key not in self.ocr_readers:
+            try:
+                self.ocr_readers[key] = easyocr.Reader(lang_list, gpu=False)
+            except Exception as exc:  # pragma: no cover
+                LOGGER.warning("Unable to initialize EasyOCR for %s: %s", lang_list, exc)
+                self.ocr_readers[key] = None
+        return self.ocr_readers.get(key)
 
     def _run_caption(self, image: Any, mode: str, language: str) -> Optional[OpenVisionResult]:
         if self.caption_pipeline is None:

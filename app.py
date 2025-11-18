@@ -33,7 +33,7 @@ from services.tts_service import TTSService
 from utils.camera_utils import bgr_frame_to_pil, generate_emergency_tone
 from utils.embeddings import EmbeddingClient
 
-load_dotenv()
+load_dotenv(override=True)
 
 if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -621,6 +621,7 @@ def main() -> None:
     video_col, guidance_col = st.columns([2, 1])
     with video_col:
         st.subheader("Live camera feed")
+        preview_placeholder: Any = st.empty()
         webrtc_ctx = webrtc_streamer(
             key="guidely-webrtc",
             mode=WebRtcMode.SENDRECV,
@@ -638,9 +639,9 @@ def main() -> None:
             desired_playing_state=st.session_state["camera_active"],
         )
 
-    guidance_placeholder = guidance_col.empty()
-    recognized_placeholder = guidance_col.empty()
-    audio_placeholder = guidance_col.empty()
+    guidance_placeholder: Any = guidance_col.empty()
+    recognized_placeholder: Any = guidance_col.empty()
+    audio_placeholder: Any = guidance_col.empty()
 
     render_guidance_panel(guidance_placeholder, recognized_placeholder)
 
@@ -679,6 +680,7 @@ def main() -> None:
 
         if frame is not None:
             image = bgr_frame_to_pil(frame)
+            preview_placeholder.image(image, caption="Current camera frame", use_column_width=True)
             result = analyze_image(
                 image=image,
                 services=services,
@@ -708,6 +710,10 @@ def main() -> None:
                     format="audio/mp3",
                     autoplay=True,
                 )
+    elif st.session_state.get("camera_active"):
+        guidance_col.info(
+            "Waiting for camera connection… check that TURN/STUN settings are reachable from this network."
+        )
 
 
 if __name__ == "__main__":
