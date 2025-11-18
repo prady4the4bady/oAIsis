@@ -5,6 +5,7 @@ if os.name == "nt":
 
 import asyncio
 import json
+import logging
 import platform
 import queue
 import re
@@ -25,6 +26,7 @@ from streamlit_webrtc import (
     webrtc_streamer,
 )
 from services.gemini_service import GeminiService
+from services.open_vision import OpenVisionResult, OpenVisionService
 from services.opus_service import OpusLogger
 from services.qdrant_service import QdrantMemory
 from services.tts_service import TTSService
@@ -38,6 +40,8 @@ if platform.system() == "Windows":
 
 FRAME_INTERVAL_SECONDS = float(os.getenv("ANALYSIS_INTERVAL_SECONDS", "2"))
 DEFAULT_MEMORY_ENABLED = (os.getenv("ENABLE_MEMORY", "true").lower() == "true")
+
+LOGGER = logging.getLogger(__name__)
 
 FrameArray = NDArray[np.uint8]
 EmbeddingArray = NDArray[Any]
@@ -185,15 +189,29 @@ def init_session_state() -> None:
 
 @st.cache_resource(show_spinner=False)
 def get_services() -> Dict[str, object]:
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+    gemini_api_key = os.getenv("GEMINI_API_KEY") or None
     opus_api_url = os.getenv("OPUS_API_URL", "")
     opus_api_key = os.getenv("OPUS_API_KEY", "")
     qdrant_url = os.getenv("QDRANT_URL", "")
     qdrant_key = os.getenv("QDRANT_API_KEY", "")
     qdrant_collection = os.getenv("QDRANT_COLLECTION", "guidely_scenes")
+    project_id = os.getenv("GOOGLE_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
+    vertex_location = os.getenv("GOOGLE_VERTEX_LOCATION", "us-central1")
+    gemini_model = os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.0-flash-exp")
+    embedding_model = os.getenv("GOOGLE_EMBEDDING_MODEL", "text-embedding-004")
 
-    gemini = GeminiService(api_key=gemini_api_key)
-    embeddings = EmbeddingClient(api_key=gemini_api_key)
+    gemini = GeminiService(
+        api_key=gemini_api_key,
+        model=gemini_model,
+        project_id=project_id,
+        location=vertex_location,
+    )
+    embeddings = EmbeddingClient(
+        api_key=gemini_api_key,
+        model=embedding_model,
+        project_id=project_id,
+        location=vertex_location,
+    )
     qdrant = None
     if qdrant_url:
         qdrant = QdrantMemory(
@@ -204,6 +222,7 @@ def get_services() -> Dict[str, object]:
 
     opus = OpusLogger(api_url=opus_api_url, api_key=opus_api_key)
     tts = TTSService()
+    open_vision = OpenVisionService()
 
     return {
         "gemini": gemini,
@@ -211,6 +230,7 @@ def get_services() -> Dict[str, object]:
         "qdrant": qdrant,
         "opus": opus,
         "tts": tts,
+        "open_vision": open_vision,
     }
 
 
@@ -234,29 +254,14 @@ def analyze_image(
     embeddings: EmbeddingClient = services["embeddings"]
     qdrant: Optional[QdrantMemory] = services.get("qdrant")
     opus: OpusLogger = services["opus"]
+    open_vision: OpenVisionService = services["open_vision"]
 
-    prompt = MODE_PROMPTS[mode]
-    language_note = LANGUAGE_INSTRUCTIONS.get(language, "Respond clearly.")
-    opus.log_action(
-        action="scene_analysis_started",
-        data={"mode": mode, "language": language},
-    )
-
-    try:
-        response_mime = "application/json" if mode == "navigation" else None
-        raw_response = gemini.analyze_image(
-            image=image,
-            user_prompt=f"{prompt}\n\n{language_note}",
-            response_mime_type=response_mime,
-        )
-        guidance_text = raw_response
-        detected_objects: List[DetectedObject] = []
-        movement: Optional[MovementAdvice] = None
-        if mode == "navigation":
-            guidance_text, detected_objects, movement = parse_navigation_response(raw_response)
-        if not guidance_text:
-            raise ValueError("Gemini did not return guidance.")
-
+    def build_result(
+        guidance_text: str,
+        detected_objects: List[DetectedObject],
+        movement: Optional[MovementAdvice],
+        provider: str,
+    ) -> AnalysisResult:
         embedding_vector = embeddings.embed_text(guidance_text)
         recognized = None
 
@@ -277,7 +282,7 @@ def analyze_image(
                 )
         opus.log_action(
             action="scene_analysis_completed",
-            data={"mode": mode, "language": language},
+            data={"mode": mode, "language": language, "provider": provider},
         )
 
         return AnalysisResult(
@@ -287,6 +292,60 @@ def analyze_image(
             objects=detected_objects,
             movement=movement,
         )
+
+    prompt = MODE_PROMPTS[mode]
+    language_note = LANGUAGE_INSTRUCTIONS.get(language, "Respond clearly.")
+    opus.log_action(
+        action="scene_analysis_started",
+        data={"mode": mode, "language": language},
+    )
+
+    open_result: Optional[OpenVisionResult] = None
+    if open_vision.available:
+        try:
+            open_result = open_vision.analyze(image=image, mode=mode, language=language)
+        except Exception as exc:  # pragma: no cover - best effort fallback
+            LOGGER.warning("Open vision analysis failed: %s", exc)
+    if open_result:
+        guidance_text = open_result.guidance
+        detected_objects: List[DetectedObject] = []
+        for entry in open_result.objects:
+            label = entry.get("label")
+            if not isinstance(label, str) or not label.strip():
+                continue
+            detected_objects.append(
+                DetectedObject(
+                    label=label.strip(),
+                    distance_m=cast(Optional[float], entry.get("distance_m")),
+                    direction=entry.get("direction"),
+                )
+            )
+        movement_dict = open_result.movement or {}
+        movement = None
+        suggestion = movement_dict.get("suggestion") if isinstance(movement_dict, dict) else None
+        if isinstance(suggestion, str) and suggestion.strip():
+            reason = movement_dict.get("reason") if isinstance(movement_dict, dict) else None
+            movement = MovementAdvice(
+                suggestion=suggestion.strip(),
+                reason=reason.strip() if isinstance(reason, str) and reason.strip() else None,
+            )
+        return build_result(guidance_text, detected_objects, movement, provider="open_vision")
+
+    try:
+        response_mime = "application/json" if mode == "navigation" else None
+        raw_response = gemini.analyze_image(
+            image=image,
+            user_prompt=f"{prompt}\n\n{language_note}",
+            response_mime_type=response_mime,
+        )
+        guidance_text = raw_response
+        detected_objects: List[DetectedObject] = []
+        movement: Optional[MovementAdvice] = None
+        if mode == "navigation":
+            guidance_text, detected_objects, movement = parse_navigation_response(raw_response)
+        if not guidance_text:
+            raise ValueError("Gemini did not return guidance.")
+        return build_result(guidance_text, detected_objects, movement, provider="gemini")
     except Exception as exc:
         opus.log_action(
             action="scene_analysis_completed",

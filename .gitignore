@@ -12,6 +12,8 @@ venv/
 .env.local
 .env.*.local
 !.env.example
+oaisis-*.json
+*service_account*.json
 
 # Streamlit cache
 .streamlit/cache/

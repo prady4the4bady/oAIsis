@@ -43,6 +43,7 @@ class OpusLogger:
         if self.workflow_id:
             payload.setdefault("data", {})
             payload["data"]["workflow_id"] = self.workflow_id
+            payload["workflow_id"] = self.workflow_id
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

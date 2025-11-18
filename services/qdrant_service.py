@@ -41,7 +41,7 @@ class QdrantMemory:
         self._ensure_collection()
 
     def _resolve_vector_size(self) -> int:
-        env_value = os.getenv("QDRANT_VECTOR_SIZE")
+        env_value = os.getenv("QDRANT_VECTOR_SIZE") or os.getenv("GUIDELY_EMBEDDING_DIM")
         if env_value:
             try:
                 parsed = int(env_value)
@@ -49,9 +49,9 @@ class QdrantMemory:
                     return parsed
             except ValueError:
                 LOGGER.warning(
-                    "Invalid QDRANT_VECTOR_SIZE '%s'; defaulting to 3072.", env_value
+                    "Invalid QDRANT_VECTOR_SIZE '%s'; defaulting to 384.", env_value
                 )
-        return 3072
+        return 384
 
     def _ensure_collection(self) -> None:
         try:
