@@ -15,8 +15,9 @@ venv/
 oaisis-*.json
 *service_account*.json
 
-# Streamlit cache
+# Streamlit cache & secrets
 .streamlit/cache/
+.streamlit/secrets.toml
 
 # OS / editor junk
 .DS_Store
